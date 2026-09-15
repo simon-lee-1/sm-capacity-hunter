@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **This repository has moved to [simon-lee-1/sagemaker-inference-endpoint-capacity](https://github.com/simon-lee-1/sagemaker-inference-endpoint-capacity).**
+>
+> It is archived and no longer maintained. The project was renamed and the
+> module is now `src/capacity.py`. Everything here is superseded; nothing was
+> lost in the move.
+
 # sm-capacity-hunter
 
 Retries a SageMaker real-time endpoint until scarce on-demand GPU capacity lands,
