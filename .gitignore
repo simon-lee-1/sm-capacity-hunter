@@ -1,0 +1,10 @@
+# sam build output — regenerable with `sam build`
+.aws-sam/
+
+# Written by `sam deploy --guided`. Holds your stack name, deployment bucket and
+# parameter overrides, including the SageMaker role ARN with a real account ID.
+samconfig.toml
+
+__pycache__/
+*.py[cod]
+.DS_Store

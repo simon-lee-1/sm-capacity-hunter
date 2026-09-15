@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Hunts scarce on-demand SageMaker GPU capacity (default ml.g6.2xlarge in
+  ap-southeast-2) and holds it. EventBridge invokes one Lambda tick per minute;
+  each tick advances a state machine whose only state store is the live
+  endpoint. Deploy with: sam build && sam deploy --guided
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Fill this in — deployment fails without it" }
+        Parameters: [SageMakerRoleArn]
+      - Label: { default: "Capacity to hunt" }
+        Parameters: [TargetRegion, InstanceType, InstanceCount, EndpointName]
+      - Label: { default: "Container (defaults work as-is; override any time)" }
+        Parameters: [ImageUri, ContainerEnvJson, ModelDataUrl]
+      - Label: { default: "Behaviour" }
+        Parameters: [Schedule, RetryUnknown, ReclaimAfterSeconds, NotifyEmail]
+    ParameterLabels:
+      SageMakerRoleArn: { default: "SageMaker execution role ARN (required)" }
+      TargetRegion: { default: "Region to hunt capacity in" }
+      InstanceType: { default: "Instance type to hold" }
+      InstanceCount: { default: "How many instances" }
+      EndpointName: { default: "Endpoint name (lowercase)" }
+      ImageUri: { default: "Inference container image URI" }
+      ContainerEnvJson: { default: "Container environment, as JSON" }
+      ModelDataUrl: { default: "s3:// model.tar.gz (blank if the image needs none)" }
+      Schedule: { default: "How often to tick" }
+      RetryUnknown: { default: "Retry unrecognised failure reasons?" }
+      ReclaimAfterSeconds: { default: "Seconds OutOfService before re-hunting" }
+      NotifyEmail: { default: "Email to alert (blank for none)" }
+
+Parameters:
+
+  # ---- the one value that has no sensible default ------------------------------
+  SageMakerRoleArn:
+    Type: String
+    Description: >
+      IAM role SageMaker assumes to pull the image and read the model artefact.
+      No default on purpose: this is account-specific and must be supplied.
+      Needs AmazonSageMakerFullAccess or equivalent, and a trust policy for
+      sagemaker.amazonaws.com.
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$"
+    ConstraintDescription: must be an IAM role ARN, e.g. arn:aws:iam::123456789012:role/MySageMakerRole
+
+  # ---- capacity ----------------------------------------------------------------
+  TargetRegion:
+    Type: String
+    Default: ap-southeast-2
+    Description: >
+      Region the SageMaker endpoint is created in. This is NOT the same thing as
+      the region you deploy the stack into — the Lambda calls SageMaker with this
+      region explicitly, so a hunter deployed in one region can hunt in another.
+      Usually you want them to match. If you change this, change ImageUri to a
+      container in the same region: preflight FAILs on a mismatch rather than
+      letting every attempt die looking like scarcity.
+    AllowedPattern: "^[a-z]{2}-[a-z-]+-[0-9]$"
+    ConstraintDescription: must be a region code, e.g. ap-southeast-2
+
+  InstanceType:
+    Type: String
+    Default: ml.g6.2xlarge
+    Description: Any SageMaker inference instance type, e.g. ml.g6.2xlarge, ml.g6.4xlarge, ml.g5.2xlarge.
+    AllowedPattern: "^ml\\.[a-z0-9]+\\.[a-z0-9]+$"
+    ConstraintDescription: must look like ml.g6.2xlarge
+
+  InstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 20
+    Description: Instances to hold. Your service quota must be at least this high.
+
+  EndpointName:
+    Type: String
+    Default: capacity-hold-ep
+    Description: >
+      Lowercase only. SageMaker lowercases endpoint names inside ARNs, so
+      enforcing it here keeps the scoped IAM policy correct.
+    AllowedPattern: "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    ConstraintDescription: lowercase letters, digits and hyphens only, max 63 characters
+
+  # ---- container ---------------------------------------------------------------
+  ImageUri:
+    Type: String
+    Default: 763104351884.dkr.ecr.ap-southeast-2.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-gpu-py310-cu118-ubuntu20.04
+    Description: >
+      Must be an image in TargetRegion. Defaults to the AWS Deep Learning
+      Container for HuggingFace inference in ap-southeast-2, chosen because
+      paired with the default ContainerEnvJson it needs no S3 model artefact.
+      The exact tag has NOT been verified against ECR — see README before you
+      rely on it. Change it at any time with
+      sam deploy --parameter-overrides ImageUri=...  (no code change needed).
+
+  ContainerEnvJson:
+    Type: String
+    Default: '{"HF_MODEL_ID":"distilbert-base-uncased","HF_TASK":"fill-mask"}'
+    Description: >
+      JSON object of container environment variables. The default makes the
+      HuggingFace container download a small model at startup so it passes its
+      /ping health check with no model.tar.gz. Use {} if your image needs none.
+
+  ModelDataUrl:
+    Type: String
+    Default: ""
+    Description: s3://bucket/key/model.tar.gz. Leave blank when the image loads its own weights.
+    AllowedPattern: "^(|s3://.+)$"
+    ConstraintDescription: must be blank or an s3:// URL
+
+  # ---- behaviour ---------------------------------------------------------------
+  Schedule:
+    Type: String
+    Default: rate(1 minute)
+    Description: >
+      EventBridge schedule expression. One minute is the useful floor: each tick
+      is only ever one step, and SageMaker takes minutes to fail a create.
+
+  RetryUnknown:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
+    Description: >
+      false (recommended) halts on any FailureReason that is not a recognised
+      capacity error, so a broken container cannot masquerade as scarcity.
+      Set true only once you have seen the reason and know it is transient.
+
+  ReclaimAfterSeconds:
+    Type: Number
+    Default: 900
+    MinValue: -1
+    Description: >
+      If a held endpoint goes OutOfService, wait this long for SageMaker to
+      self-heal, then delete and re-hunt. -1 never deletes.
+
+  NotifyEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Creates an SNS topic and subscribes this address, so you hear
+      about capacity landing, capacity lost, and halts. Confirm the subscription
+      email or nothing is delivered.
+    AllowedPattern: "^(|[^@\\s]+@[^@\\s]+\\.[^@\\s]+)$"
+    ConstraintDescription: must be blank or a valid email address
+
+Conditions:
+  WantsEmail: !Not [!Equals [!Ref NotifyEmail, ""]]
+
+Resources:
+
+  HunterFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # There are no third-party dependencies — boto3 ships with the runtime — so
+      # src/Makefile just copies the module in. This deliberately avoids SAM's pip
+      # builder, which refuses to build unless a local python matching Runtime
+      # below is on PATH. Nothing here is coupled to your local Python version.
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}"
+      Description: !Sub "One tick of the hunt for ${InstanceType} x${InstanceCount} in ${TargetRegion}"
+      CodeUri: src/
+      Handler: sm_capacity_hunter.lambda_handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          REGION: !Ref TargetRegion
+          INSTANCE_TYPE: !Ref InstanceType
+          INSTANCE_COUNT: !Ref InstanceCount
+          ENDPOINT_NAME: !Ref EndpointName
+          MODEL_NAME: !Sub "${EndpointName}-model"
+          ROLE_ARN: !Ref SageMakerRoleArn
+          IMAGE_URI: !Ref ImageUri
+          CONTAINER_ENV: !Ref ContainerEnvJson
+          MODEL_DATA_URL: !Ref ModelDataUrl
+          RETRY_UNKNOWN: !Ref RetryUnknown
+          RECLAIM_AFTER_SECONDS: !Ref ReclaimAfterSeconds
+          SNS_TOPIC_ARN: !If [WantsEmail, !Ref AlertTopic, ""]
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Name: !Sub "${AWS::StackName}-tick"
+            Description: one capacity-hunter tick
+            Schedule: !Ref Schedule
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # Scoped to this one endpoint in TargetRegion — NOT AWS::Region, which
+            # is where the Lambda runs and may differ. Config and model names are
+            # derived at runtime, so those stay wildcarded within the account.
+            - Sid: EndpointLifecycle
+              Effect: Allow
+              Action:
+                - sagemaker:CreateEndpoint
+                - sagemaker:DeleteEndpoint
+                - sagemaker:DescribeEndpoint
+                - sagemaker:AddTags
+                - sagemaker:ListTags
+              Resource: !Sub "arn:${AWS::Partition}:sagemaker:${TargetRegion}:${AWS::AccountId}:endpoint/${EndpointName}"
+            # CreateEndpoint is authorised against TWO resources: the endpoint it
+            # creates AND the endpoint config it reads. Granting only the endpoint
+            # ARN above yields AccessDenied naming the endpoint-config ARN — and
+            # classify() calls "not authorized" fatal, so the hunt halts on its
+            # very first tick. Verified against the live API, not inferred.
+            - Sid: CreateEndpointAlsoReadsItsConfig
+              Effect: Allow
+              Action: sagemaker:CreateEndpoint
+              Resource: !Sub "arn:${AWS::Partition}:sagemaker:${TargetRegion}:${AWS::AccountId}:endpoint-config/*"
+            - Sid: ModelAndConfig
+              Effect: Allow
+              Action:
+                - sagemaker:CreateEndpointConfig
+                - sagemaker:DescribeEndpointConfig
+                - sagemaker:CreateModel
+                - sagemaker:DescribeModel
+                - sagemaker:AddTags
+              Resource:
+                - !Sub "arn:${AWS::Partition}:sagemaker:${TargetRegion}:${AWS::AccountId}:endpoint-config/*"
+                - !Sub "arn:${AWS::Partition}:sagemaker:${TargetRegion}:${AWS::AccountId}:model/*"
+            - Sid: PassExecutionRoleToSageMakerOnly
+              Effect: Allow
+              Action: iam:PassRole
+              Resource: !Ref SageMakerRoleArn
+              Condition:
+                StringEquals:
+                  iam:PassedToService: sagemaker.amazonaws.com
+            - Sid: QuotaPreflight
+              Effect: Allow
+              Action:
+                - servicequotas:ListServiceQuotas
+                - servicequotas:ListAWSDefaultServiceQuotas
+                - servicequotas:GetServiceQuota
+              Resource: "*"
+      Tags:
+        managed-by: sm-capacity-hunter
+        holds: !Sub "${InstanceType}-x${InstanceCount}"
+
+  # Kept out of the function's Policies list so no intrinsic has to be evaluated
+  # inside a policy document. HunterFunctionRole is the role SAM generates for
+  # the function above.
+  AlertPublishPolicy:
+    Type: AWS::IAM::Policy
+    Condition: WantsEmail
+    Properties:
+      PolicyName: publish-capacity-alerts
+      Roles: [!Ref HunterFunctionRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: WantsEmail
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: capacity-hunter
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotifyEmail
+
+Outputs:
+
+  FunctionName:
+    Description: The Lambda that ticks
+    Value: !Ref HunterFunction
+
+  RuleName:
+    Description: Disable this rule to pause the hunt without deleting the stack
+    Value: !Sub "${AWS::StackName}-tick"
+
+  EndpointName:
+    Description: The endpoint that will hold the capacity
+    Value: !Ref EndpointName
+
+  TargetRegion:
+    Description: >-
+      Region the endpoint is created in. If this differs from the stack region,
+      the endpoint will not appear in the console region you deployed to.
+    Value: !Ref TargetRegion
+
+  AlertTopicArn:
+    Condition: WantsEmail
+    Description: Confirm the subscription email or no alerts are delivered
+    Value: !Ref AlertTopic
+
+  WatchLogs:
+    Description: Follow the hunt
+    Value: !Sub "aws logs tail /aws/lambda/${AWS::StackName} --follow --region ${AWS::Region}"
+
+  RunPreflight:
+    Description: Run the checks inside the deployed function
+    Value: !Sub >-
+      aws lambda invoke --function-name ${AWS::StackName} --region ${AWS::Region}
+      --payload '{"preflight":true}' --cli-binary-format raw-in-base64-out /dev/stdout
+
+  PauseHunt:
+    Description: Stop ticking; a held endpoint keeps running
+    Value: !Sub "aws events disable-rule --name ${AWS::StackName}-tick --region ${AWS::Region}"
+
+  ReleaseCapacity:
+    Description: >-
+      Deleting the stack does NOT delete the endpoint. This does. Note the region
+      is TargetRegion, where the endpoint lives, not the stack region.
+    Value: !Sub >-
+      python3 src/sm_capacity_hunter.py --release --yes --region ${TargetRegion}
+      --endpoint-name ${EndpointName}
